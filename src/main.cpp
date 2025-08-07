@@ -23,21 +23,27 @@ void generateTables() {
     Serial.println("Generating tables...");
 
     for(int i = 0; i < WAVETABLE_SIZE; i++) {
-        
+        float base_rms = 0.25;
         float angle = (2.0 * PI * i) / WAVETABLE_SIZE;
 
         // multipler is amplitude / volume of output; messing with values to try and get a consistent sounding volume
 
-        sine_table[i] = (int16_t)(sin(angle) * 32767 * 0.35);
+        // rms
+        float sine_mult = base_rms / 0.707f;
+        float square_mult = base_rms / 0.577f;
+        float sawtooth_mult = base_rms / 4.0f;
+        float triangle_mult = base_rms / 0.577f;
 
-        square_table[i] = (angle < PI) ? 32767 * 0.25 : -32767 * 0.2;
+        sine_table[i] = (int16_t)(sin(angle) * 32767 * sine_mult);
 
-        sawtooth_table[i] = (int16_t)((2.0 * i / WAVETABLE_SIZE - 1.0) * 32767 * 0.18);
+        square_table[i] = (angle < PI) ? 32767 * square_mult : -32767 * square_mult;
+
+        sawtooth_table[i] = (int16_t)((2.0 * i / WAVETABLE_SIZE - 1.0) * 32767 * sawtooth_mult);
 
         if (i < WAVETABLE_SIZE / 2) {
-            triangle_table[i] = (int16_t)((4.0 * i / WAVETABLE_SIZE - 1.0) * 32767 * 0.3);
+            triangle_table[i] = (int16_t)((4.0 * i / WAVETABLE_SIZE - 1.0) * 32767 * triangle_mult);
         } else {
-            triangle_table[i] = (int16_t)((3.0 - 4.0 * i / WAVETABLE_SIZE) * 32767 * 0.3);
+            triangle_table[i] = (int16_t)((3.0 - 4.0 * i / WAVETABLE_SIZE) * 32767 * triangle_mult);
         }
     }
     Serial.println("Wavetables generated.");
