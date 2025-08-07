@@ -10,6 +10,7 @@
 
 #define WAVETABLE_SIZE 256
 #define PHASE_ACCUMULATOR_MAX 0xFFFFFFFF
+#define MAX_VOICES 8
 
 int16_t sine_table[WAVETABLE_SIZE];
 int16_t square_table[WAVETABLE_SIZE];
@@ -18,6 +19,46 @@ int16_t triangle_table[WAVETABLE_SIZE];
 
 uint32_t phase_accumulator = 0;
 uint32_t phase_increment = 0;
+
+struct Voice {
+    uint32_t phase_accumulator; 
+    uint32_t phase_increment;
+    float frequency;
+    bool active;
+    char key;
+};
+
+Voice voices[MAX_VOICES];
+
+int searchFreeVoice() {
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (!voices[i].active) return i;
+    }
+    return -1;
+}
+
+void StartNote(float frequency, char key) {
+    int voice = searchFreeVoice();
+    if (voice >= 0) {
+        voices[voice].frequency = frequency;
+        voices[voice].phase_increment = (uint32_t)((frequency * (1ULL << 32)) / SAMPLE_RATE);
+        voices[voice].phase_accumulator = 0;
+        voices[voice].active = true;
+        voices[voice].key = key;
+    } else {
+        Serial.println("No voices freed");
+    }
+}
+
+void StopNote(char key) {
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (voices[i].active && voices[i].key == key) {
+            voices[i].active = false;
+            Serial.printf("Freed voice %d\n", i);
+            break;
+        }
+    }
+}
 
 void generateTables() {
     Serial.println("Generating tables...");
