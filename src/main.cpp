@@ -8,7 +8,7 @@
 #define I2S_NUM     I2S_NUM_0
 #define SAMPLE_RATE 44100
 
-#define WAVETABLE_SIZE 256
+#define WAVETABLE_SIZE 512
 #define PHASE_ACCUMULATOR_MAX 0xFFFFFFFF
 #define MAX_VOICES 8
 
@@ -45,6 +45,7 @@ void StartNote(float frequency, char key) {
         voices[voice].phase_accumulator = 0;
         voices[voice].active = true;
         voices[voice].key = key;
+        Serial.printf("Started note %c at %.2f Hz, voice %d\n", key, frequency, voice);
     } else {
         Serial.println("No voices freed");
     }
@@ -64,44 +65,49 @@ void generateTables() {
     Serial.println("Generating tables...");
 
     for(int i = 0; i < WAVETABLE_SIZE; i++) {
-        float base_rms = 0.25;
         float angle = (2.0 * PI * i) / WAVETABLE_SIZE;
 
-        // multipler is amplitude / volume of output; messing with values to try and get a consistent sounding volume
+        sine_table[i] = (int16_t)(sin(angle) * 16383);
 
-        // rms
-        float sine_mult = base_rms / 0.707f;
-        float square_mult = base_rms / 0.577f;
-        float sawtooth_mult = base_rms / 4.0f;
-        float triangle_mult = base_rms / 0.577f;
+        square_table[i] = (angle < PI) ? 16383 : -16383;
 
-        sine_table[i] = (int16_t)(sin(angle) * 32767 * sine_mult);
-
-        square_table[i] = (angle < PI) ? 32767 * square_mult : -32767 * square_mult;
-
-        sawtooth_table[i] = (int16_t)((2.0 * i / WAVETABLE_SIZE - 1.0) * 32767 * sawtooth_mult);
+        sawtooth_table[i] = (int16_t)((2.0 * i / WAVETABLE_SIZE - 1.0) * 16383);
 
         if (i < WAVETABLE_SIZE / 2) {
-            triangle_table[i] = (int16_t)((4.0 * i / WAVETABLE_SIZE - 1.0) * 32767 * triangle_mult);
+            triangle_table[i] = (int16_t)((4.0 * i / WAVETABLE_SIZE - 1.0) * 16383);
         } else {
-            triangle_table[i] = (int16_t)((3.0 - 4.0 * i / WAVETABLE_SIZE) * 32767 * triangle_mult);
+            triangle_table[i] = (int16_t)((3.0 - 4.0 * i / WAVETABLE_SIZE) * 16383);
         }
     }
     Serial.println("Wavetables generated.");
-};
+}
 
-void setFrequency(float frequency) {
-    phase_increment = (uint32_t)((frequency * (1ULL << 32)) / SAMPLE_RATE);
-    Serial.printf("Set frequency: %.2f Hz\n", frequency);
+int16_t getIndividualSample(Voice &voice, int16_t* wavetable) {
+    uint32_t table_index = voice.phase_accumulator >> (32 - 9);
+    int16_t sample = wavetable[table_index];
+    voice.phase_accumulator += voice.phase_increment;
+    return sample;
 }
 
 int16_t getNextSample(int16_t* wavetable) {
-    uint32_t table_index = phase_accumulator >> 24;
-    int16_t sample = wavetable[table_index];
+    int32_t mixed_sample = 0;
+    int active_count = 0;
 
-    phase_accumulator += phase_increment;
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (voices[i].active) {
+            mixed_sample += getIndividualSample(voices[i], wavetable);
+            active_count++;
+        }
+    }
 
-    return sample;
+    if (active_count > 0) {
+        if (mixed_sample > 32767) mixed_sample = 32767;
+        if (mixed_sample < -32768) mixed_sample = -32768;
+        
+        return (int16_t)mixed_sample;
+    } else {
+        return 0;
+    }
 }
 
 void setup() {
@@ -142,23 +148,47 @@ void setup() {
 }
 
 void loop() {
-    int16_t* waveforms[] = {sine_table, square_table, sawtooth_table, triangle_table};
-    const char* names[] = {"Sine", "Square", "Sawtooth", "TRiangle"};
-    float frequencies[] = {440.0, 660.0, 880.0};
+    static unsigned long start_time = millis();
+    unsigned long elapsed = millis() - start_time;
 
-    for (int wave = 0; wave < 4; wave++) {
-        for(int freq = 0; freq < 3; freq++) {
-            Serial.printf("Playing %s wave @ %.0f Hz\n", names[wave], frequencies[freq]);
-            setFrequency(frequencies[freq]);
-
-            for(int i = 0; i < SAMPLE_RATE * 3; i++) {
-                int16_t sample = getNextSample(waveforms[wave]);
-                uint32_t stereo_sample = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;
-
-                size_t bytes_written;
-                i2s_write(I2S_NUM, &stereo_sample, 4, &bytes_written, portMAX_DELAY);
+    if (elapsed < 2000) {
+        StopNote('B');
+        bool a_playing = false;
+        for(int i = 0; i < MAX_VOICES; i++) {
+            if(voices[i].active && voices[i].key == 'A') {
+                a_playing = true;
+                break;
             }
         }
+        if(!a_playing) StartNote(440.0, 'A');
     }
-    delay(2000);
+    else if (elapsed < 4000) {
+        bool b_playing = false;
+        for(int i = 0; i < MAX_VOICES; i++) {
+            if(voices[i].active && voices[i].key == 'B') {
+                b_playing = true;
+                break;
+            }
+        }
+        if(!b_playing) StartNote(880.0, 'B');
+    }
+    else if (elapsed < 6000) {
+        StopNote('A');
+    }
+    else {
+        start_time = millis();
+    }
+
+    const int BUFFER_SIZE = 1024;
+    uint32_t stereo_samples[BUFFER_SIZE];
+    
+    int16_t* waveform = sine_table;
+    
+    for(int i = 0; i < BUFFER_SIZE; i++) {
+        int16_t sample = getNextSample(waveform);
+        stereo_samples[i] = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;
+    }
+    
+    size_t bytes_written;
+    i2s_write(I2S_NUM, stereo_samples, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
 }
