@@ -1,12 +1,14 @@
 #include <Arduino.h>
 #include "driver/i2s.h"
 #include <math.h>
+#include "esp_system.h"
 
 #define I2S_BCLK    5
 #define I2S_LRC     6
 #define I2S_DIN     4
 #define I2S_NUM     I2S_NUM_0
 #define SAMPLE_RATE 44100
+#define MASTER_GAIN 2.0f
 
 #define WAVETABLE_SIZE 512
 #define PHASE_ACCUMULATOR_MAX 0xFFFFFFFF
@@ -42,7 +44,7 @@ void StartNote(float frequency, char key) {
     if (voice >= 0) {
         voices[voice].frequency = frequency;
         voices[voice].phase_increment = (uint32_t)((frequency * (1ULL << 32)) / SAMPLE_RATE);
-        voices[voice].phase_accumulator = 0;
+        voices[voice].phase_accumulator = esp_random();
         voices[voice].active = true;
         voices[voice].key = key;
         Serial.printf("Started note %c at %.2f Hz, voice %d\n", key, frequency, voice);
@@ -101,10 +103,12 @@ int16_t getNextSample(int16_t* wavetable) {
     }
 
     if (active_count > 0) {
-        if (mixed_sample > 32767) mixed_sample = 32767;
-        if (mixed_sample < -32768) mixed_sample = -32768;
-        
-        return (int16_t)mixed_sample;
+        float out = (float)mixed_sample / (float)active_count;
+        out *= MASTER_GAIN;
+        int32_t s = (int32_t)out;
+        if (s > 32767) s = 32767;
+        if (s < -32768) s = -32768;
+        return (int16_t)s;
     } else {
         return 0;
     }
