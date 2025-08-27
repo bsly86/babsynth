@@ -3,196 +3,471 @@
 #include <math.h>
 #include "esp_system.h"
 
-#define I2S_BCLK    5
-#define I2S_LRC     6
-#define I2S_DIN     4
-#define I2S_NUM     I2S_NUM_0
+#define I2S_BCLK 5
+#define I2S_LRC 6
+#define I2S_DIN 4
+#define I2S_NUM I2S_NUM_0
+#define GAIN_PIN 7
 #define SAMPLE_RATE 44100
-#define MASTER_GAIN 2.0f
+#define MASTER_GAIN 1.0f
 
-#define WAVETABLE_SIZE 512
+#define PIN_SINE 9
+#define PIN_SQUARE 10
+#define PIN_SAW 11
+#define PIN_TRIANGLE 12
+int16_t* selectedWaveTable;
+
+#define WAVETABLE_SIZE 2048
 #define PHASE_ACCUMULATOR_MAX 0xFFFFFFFF
 #define MAX_VOICES 8
+
+float compressorGain = 1.0f;
+float compressorAttack = 0.001f;
+float compressorRelease = 0.1f;
+
+#define WHOLE 4.0f
+#define HALF 2.0f
+#define QUARTER 1.0f
+#define EIGHTH 0.5f
+#define SIXTEENTH 0.25f
+
+// Song-specific configs
+#define PPQ 480
+double samplesPerTick;
+int songIndex = 0;
+
+struct NoteEvent {
+  const char* note;
+  float startBeat;
+  float duration;
+  char key;
+};
+
+#define SONG_LEGEND 1
+#define CURRENT_SONG SONG_LEGEND
+
+#if CURRENT_SONG == SONG_LEGEND
+  #include "songs/theLegend.h"
+  const NoteEvent* song = theLegend;
+#endif
+
+enum ADSRState {
+  Inactive,
+  Attack,
+  Decay,
+  Sustain,
+  Release,
+};
+
+struct ADSR {
+  float attack;
+  float decay;
+  float sustain;
+  float release;
+
+  ADSRState state;
+};
+
+enum EventType {
+  NoteOn,
+  NoteOff,
+  TempoChange,
+};
+
+struct InternalEvent {
+  uint64_t sampleTime;
+  float frequency;
+  char key;
+  bool noteOn;
+  EventType type;
+  float newBPM;
+};
+
+struct TempoEvent {
+  float beat; 
+  float bpm;
+};
+
+TempoEvent tempoMap[] = {
+  {0.0f, 110},
+  {164.0f, 165},
+  {0, 0}
+};
+
+InternalEvent events[2048];
+int eventCount = 0;
+int eventIndex = 0;
 
 int16_t sine_table[WAVETABLE_SIZE];
 int16_t square_table[WAVETABLE_SIZE];
 int16_t sawtooth_table[WAVETABLE_SIZE];
 int16_t triangle_table[WAVETABLE_SIZE];
 
-uint32_t phase_accumulator = 0;
-uint32_t phase_increment = 0;
-
 struct Voice {
-    uint32_t phase_accumulator; 
-    uint32_t phase_increment;
-    float frequency;
-    bool active;
-    char key;
+  uint32_t phase_accumulator;
+  uint32_t phase_increment;
+  float frequency;
+  bool active;
+  char key;
+  
+  ADSRState envState;
+  float envLevel;
+  float envTime;
 };
 
 Voice voices[MAX_VOICES];
 
+uint32_t voicePhaseCounter = 0;
+
+float updateADSR(Voice *voice, ADSR *adsr, float sampleTime) {
+  voice -> envTime += sampleTime;
+
+  switch (voice -> envState) {
+    case Attack:
+      voice->envLevel = voice->envTime / adsr->attack;
+      
+      if (voice->envLevel >= 1.0f) {
+        voice->envLevel = 1.0f;
+        voice->envState = Decay;
+        voice->envTime = 0.0f;
+      }
+      break;
+
+    case Decay:
+      voice->envLevel = 1.0f - (1.0f - adsr->sustain) * (voice->envTime / adsr->decay);
+      if (voice->envTime >= adsr->decay) {
+        voice->envLevel = adsr->sustain;
+        voice->envState = Sustain;
+        voice->envTime = 0.0f;
+      }
+      break;
+
+    case Sustain:
+    voice->envLevel = adsr->sustain;
+    break;
+
+    case Release:
+      voice->envLevel = voice->envLevel * (1.0f - (voice->envTime / adsr->release));
+      if (voice->envTime >= adsr->release) {
+        voice->envLevel = 0.0f;
+        voice->envState = Inactive;
+        voice->active = false;
+      }
+      break;
+
+    case Inactive:
+    default:
+      voice->envLevel = 0.0f;
+      break;
+  }
+
+  return voice->envLevel;
+}
+
 int searchFreeVoice() {
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (!voices[i].active) return i;
-    }
-    return -1;
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (!voices[i].active) return i;
+  }
+  return -1;
+}
+
+void clearVoices(){
+  for(int i=0;i<MAX_VOICES;i++){
+    voices[i].active = false;
+    voices[i].phase_accumulator = 0;
+    voices[i].phase_increment = 0;
+    voices[i].frequency = 0.0f;
+  }
 }
 
 void StartNote(float frequency, char key) {
-    int voice = searchFreeVoice();
-    if (voice >= 0) {
-        voices[voice].frequency = frequency;
-        voices[voice].phase_increment = (uint32_t)((frequency * (1ULL << 32)) / SAMPLE_RATE);
-        voices[voice].phase_accumulator = esp_random();
-        voices[voice].active = true;
-        voices[voice].key = key;
-        Serial.printf("Started note %c at %.2f Hz, voice %d\n", key, frequency, voice);
-    } else {
-        Serial.println("No voices freed");
-    }
+  int voice = searchFreeVoice();
+  if (voice >= 0) {
+      voices[voice].frequency = frequency;
+      voices[voice].phase_increment = (uint32_t)((frequency * (1ULL << 32)) / SAMPLE_RATE);
+      voices[voice].phase_accumulator = esp_random();
+      voices[voice].active = true;
+      voices[voice].key = key;
+
+      voices[voice].envState = Attack;
+      voices[voice].envLevel = 0.0f;
+      voices[voice].envTime = 0.0f;
+  }
 }
 
 void StopNote(char key) {
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (voices[i].active && voices[i].key == key) {
-            voices[i].active = false;
-            Serial.printf("Freed voice %d\n", i);
-            break;
-        }
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (voices[i].active && voices[i].key == key) {
+      if (voices[i].envState != Release && voices[i].envState != Inactive) {
+        voices[i].envState = Release;
+        voices[i].envTime = 0.0f;
+      }
+      break;
     }
+  }
 }
 
 void generateTables() {
-    Serial.println("Generating tables...");
 
-    for(int i = 0; i < WAVETABLE_SIZE; i++) {
-        float angle = (2.0 * PI * i) / WAVETABLE_SIZE;
+  for(int i = 0; i < WAVETABLE_SIZE; i++) {
+      float angle = (2.0 * PI * i) / WAVETABLE_SIZE;
 
-        sine_table[i] = (int16_t)(sin(angle) * 16383);
+      sine_table[i] = (int16_t)(sin(angle) * 16383);
 
-        square_table[i] = (angle < PI) ? 16383 : -16383;
+      square_table[i] = (angle < PI) ? 16383 : -16383;
 
-        sawtooth_table[i] = (int16_t)((2.0 * i / WAVETABLE_SIZE - 1.0) * 16383);
+      sawtooth_table[i] = (int16_t)((2.0 * i / WAVETABLE_SIZE - 1.0) * 16383);
 
-        if (i < WAVETABLE_SIZE / 2) {
-            triangle_table[i] = (int16_t)((4.0 * i / WAVETABLE_SIZE - 1.0) * 16383);
-        } else {
-            triangle_table[i] = (int16_t)((3.0 - 4.0 * i / WAVETABLE_SIZE) * 16383);
-        }
-    }
-    Serial.println("Wavetables generated.");
+      if (i < WAVETABLE_SIZE / 2) {
+          triangle_table[i] = (int16_t)((4.0 * i / WAVETABLE_SIZE - 1.0) * 16383);
+      } else {
+          triangle_table[i] = (int16_t)((3.0 - 4.0 * i / WAVETABLE_SIZE) * 16383);
+      }
+  }
+
 }
 
-int16_t getIndividualSample(Voice &voice, int16_t* wavetable) {
-    uint32_t table_index = voice.phase_accumulator >> (32 - 9);
-    int16_t sample = wavetable[table_index];
-    voice.phase_accumulator += voice.phase_increment;
-    return sample;
+float noteToFrequency(const char* noteName) {
+  
+  static const char* names[] = {
+    "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
+  };
+  
+  int semitone=-1;
+  int octave=-1;
+  char base[3]={0};
+  base[0]=noteName[0];
+  int idx=1;
+  
+  if(noteName[1]=='#'||noteName[1]=='b') { 
+    base[1]=noteName[1]; idx++; 
+  }
+  
+  octave = atoi(&noteName[idx]);
+  
+  for(int i=0;i<12;i++) { 
+    if(strcmp(base,names[i])==0){ 
+      semitone=i; break; 
+    } 
+  }
+  
+  if(semitone<0||octave<0) {
+    return 440.0f;
+  }
+
+  int noteNumber = semitone + ((octave + 1) * 12);
+  return 440.0f * pow(2.0f,(noteNumber-69)/12.0f);
 }
 
-int16_t getNextSample(int16_t* wavetable) {
-    int32_t mixed_sample = 0;
-    int active_count = 0;
+void buildEvents() {
+  eventCount = 0;
+  eventIndex = 0;
+  
+  int tempoIndex = 0;
+  float currentBPM = tempoMap[tempoIndex].bpm;
 
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (voices[i].active) {
-            mixed_sample += getIndividualSample(voices[i], wavetable);
-            active_count++;
-        }
+  double cumulativeSamples = 0.0;
+  double lastTempoBeat = 0.0;
+  
+  for (int i = 0; song[i].note != nullptr; i++) {
+    while (tempoMap[tempoIndex + 1].bpm > 0 &&
+           song[i].startBeat >= tempoMap[tempoIndex + 1].beat) {
+      
+      double beatsInSegment = tempoMap[tempoIndex + 1].beat - lastTempoBeat;
+      double samplesPerBeat = (SAMPLE_RATE * 60.0) / currentBPM;
+      cumulativeSamples += beatsInSegment * samplesPerBeat;
+      
+      events[eventCount++] = {(uint64_t)cumulativeSamples, 0.0f, 0, false, TempoChange, tempoMap[tempoIndex + 1].bpm};
+      
+      lastTempoBeat = tempoMap[tempoIndex + 1].beat;
+      tempoIndex++;
+      currentBPM = tempoMap[tempoIndex].bpm;
     }
+    
+    double samplesPerBeat = (SAMPLE_RATE * 60.0) / currentBPM;
+    
 
-    if (active_count > 0) {
-        float out = (float)mixed_sample / (float)active_count;
-        out *= MASTER_GAIN;
-        int32_t s = (int32_t)out;
-        if (s > 32767) s = 32767;
-        if (s < -32768) s = -32768;
-        return (int16_t)s;
+    double beatsFromLastTempo = song[i].startBeat - lastTempoBeat;
+    uint64_t start = (uint64_t)(cumulativeSamples + beatsFromLastTempo * samplesPerBeat);
+    
+    double endBeat = song[i].startBeat + song[i].duration;
+    
+    uint64_t end;
+    if (tempoMap[tempoIndex + 1].bpm > 0 && endBeat > tempoMap[tempoIndex + 1].beat) {
+
+      double beatsToTempoChange = tempoMap[tempoIndex + 1].beat - song[i].startBeat;
+      double beatsAfterTempoChange = endBeat - tempoMap[tempoIndex + 1].beat;
+      
+      double samplesBeforeChange = beatsToTempoChange * samplesPerBeat;
+      double newSamplesPerBeat = (SAMPLE_RATE * 60.0) / tempoMap[tempoIndex + 1].bpm;
+      double samplesAfterChange = beatsAfterTempoChange * newSamplesPerBeat;
+      
+      end = start + (uint64_t)(samplesBeforeChange + samplesAfterChange);
     } else {
-        return 0;
+      end = start + (uint64_t)(song[i].duration * samplesPerBeat);
     }
+    
+    float freq = noteToFrequency(song[i].note);
+    events[eventCount++] = {start, freq, song[i].key, true, NoteOn, 0.0f};
+    events[eventCount++] = {end, freq, song[i].key, false, NoteOff, 0.0f};
+  }
+  
+  for(int a = 0; a < eventCount; a++){
+    for(int b = a + 1; b < eventCount; b++){
+      if(events[b].sampleTime < events[a].sampleTime){
+        InternalEvent tmp = events[a]; 
+        events[a] = events[b]; 
+        events[b] = tmp;
+      }
+    }
+  }
 }
 
-void setup() {
-    Serial.begin(115200);
-    delay(2000);
-    Serial.println("SynthTest");
-
-    generateTables();
-    
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 1024,
-        .use_apll = false,
-        .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
-    };
-    
-    esp_err_t err = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
-    Serial.printf("I2S install: %s\n", err == ESP_OK ? "SUCCESS" : "FAILED");
-    
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCLK,
-        .ws_io_num = I2S_LRC,
-        .data_out_num = I2S_DIN,
-        .data_in_num = I2S_PIN_NO_CHANGE
-    };
-    
-    err = i2s_set_pin(I2S_NUM, &pin_config);
-    Serial.printf("I2S pins: %s\n", err == ESP_OK ? "SUCCESS" : "FAILED");
-    
-    Serial.println("Synth init completed");
+void processEvents(uint64_t startSample, uint64_t endSample){
+  while(eventIndex < eventCount){
+    uint64_t t = events[eventIndex].sampleTime;
+    if(t < endSample){
+      if(events[eventIndex].noteOn) StartNote(events[eventIndex].frequency, events[eventIndex].key);
+      else StopNote(events[eventIndex].key);
+      eventIndex++;
+    } else break;
+  }
 }
 
-void loop() {
-    static unsigned long start_time = millis();
-    unsigned long elapsed = millis() - start_time;
+ADSR adsr = {
+  0.01f,
+  0.1f,
+  0.7f,
+  0.3f
+};
 
-    if (elapsed < 2000) {
-        StopNote('B');
-        bool a_playing = false;
-        for(int i = 0; i < MAX_VOICES; i++) {
-            if(voices[i].active && voices[i].key == 'A') {
-                a_playing = true;
-                break;
-            }
-        }
-        if(!a_playing) StartNote(440.0, 'A');
-    }
-    else if (elapsed < 4000) {
-        bool b_playing = false;
-        for(int i = 0; i < MAX_VOICES; i++) {
-            if(voices[i].active && voices[i].key == 'B') {
-                b_playing = true;
-                break;
-            }
-        }
-        if(!b_playing) StartNote(880.0, 'B');
-    }
-    else if (elapsed < 6000) {
-        StopNote('A');
-    }
-    else {
-        start_time = millis();
-    }
+inline int16_t getIndividualSample(Voice &voice, int16_t *wavetable){
+  uint32_t i = voice.phase_accumulator >> (32 - 11);
+  int16_t s = wavetable[i];
+  voice.phase_accumulator += voice.phase_increment;
+  return s;
+}
 
-    const int BUFFER_SIZE = 1024;
-    uint32_t stereo_samples[BUFFER_SIZE];
-    
-    int16_t* waveform = sine_table;
-    
-    for(int i = 0; i < BUFFER_SIZE; i++) {
-        int16_t sample = getNextSample(waveform);
-        stereo_samples[i] = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;
-    }
-    
-    size_t bytes_written;
-    i2s_write(I2S_NUM, stereo_samples, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
+int16_t getNextSample(int16_t *wavetable) {
+  float mix = 0.0f;
+  int activeCount = 0;
+  float sampleTime = 1.0f / SAMPLE_RATE;
+
+  const float voiceAmplitude = 0.4f;
+
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (!voices[i].active) continue;
+
+    float envLevel = updateADSR(&voices[i], &adsr, sampleTime);
+
+    int16_t raw = getIndividualSample(voices[i], wavetable);
+    float normalized = raw / 32767.0f;
+    mix += normalized * envLevel * voiceAmplitude;
+    activeCount++;
+  }
+
+  mix *= MASTER_GAIN;
+
+  float targetGain = 1.0f;
+  float absMix = fabs(mix);
+
+  if (absMix > 0.8f) {
+    targetGain = 0.8f / absMix;
+  }
+
+  if (targetGain < compressorGain) {
+    compressorGain += (targetGain - compressorGain) * (sampleTime / compressorAttack);
+  } else {
+    compressorGain += (targetGain - compressorGain) * (sampleTime / compressorRelease);
+  }
+
+  mix *= compressorGain;
+
+  if (mix > 1.0f) mix = 1.0f;
+  if (mix < -1.0f) mix = -1.0f;
+
+  return (int16_t)(mix * 32767.0f);
+}
+
+uint64_t playheadSamples = 0;
+
+void setup(){
+  
+  setCpuFrequencyMhz(240);
+
+  voicePhaseCounter = 0x12345678;
+  
+  clearVoices();
+  generateTables();
+  buildEvents();
+  
+  pinMode(PIN_SINE, INPUT_PULLUP);
+  pinMode(PIN_SQUARE, INPUT_PULLUP);
+  pinMode(PIN_SAW, INPUT_PULLUP);
+  pinMode(PIN_TRIANGLE, INPUT_PULLUP);
+
+  delay(10);
+
+  if (digitalRead(PIN_SINE) == LOW) {
+    selectedWaveTable = sine_table;
+  } else if (digitalRead(PIN_SQUARE) == LOW) {
+    selectedWaveTable = square_table;
+  } else if (digitalRead(PIN_SAW) == LOW) {
+    selectedWaveTable = sawtooth_table;
+  } else if (digitalRead(PIN_TRIANGLE) == LOW) {
+    selectedWaveTable = triangle_table;
+  } else {
+    selectedWaveTable = square_table;
+  }
+
+  pinMode(GAIN_PIN, OUTPUT);
+
+  digitalWrite(GAIN_PIN, HIGH);
+  delay(200);
+  digitalWrite(GAIN_PIN, LOW);
+  delay(200);
+  digitalWrite(GAIN_PIN, HIGH); // amp is wonky, try to ensure it's in 15db boost mode
+  delay(200);
+
+  i2s_config_t cfg = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+      .sample_rate = SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+      .dma_buf_count = 8,
+      .dma_buf_len = 1024,
+      .use_apll = false,
+      .tx_desc_auto_clear = true,
+      .fixed_mclk = 0
+  };
+  
+  i2s_driver_install(I2S_NUM, &cfg, 0, nullptr);
+
+  i2s_pin_config_t pins = {
+      .bck_io_num = I2S_BCLK,
+      .ws_io_num = I2S_LRC,
+      .data_out_num = I2S_DIN,
+      .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  i2s_set_pin(I2S_NUM, &pins);
+
+}
+
+void loop(){
+  const int BUF = 1024;
+  uint32_t stereo[BUF];
+
+  for(int i = 0; i < BUF; i++){
+    int16_t s = getNextSample(selectedWaveTable);
+    stereo[i] = ((uint32_t)(uint16_t)s << 16) | (uint16_t)s;
+  }
+
+  size_t written;
+  i2s_write(I2S_NUM, stereo, BUF * 4, &written, portMAX_DELAY);
+
+  uint64_t prev = playheadSamples;
+  playheadSamples += BUF;
+  processEvents(prev, playheadSamples);
 }
