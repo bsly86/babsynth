@@ -3,22 +3,6 @@
 #include <math.h>
 #include "esp_system.h"
 
-// Load song - goal is to make it easy to load different ones on boot
-#define SONG_LEGEND 1
-#define CURRENT_SONG SONG_LEGEND
-
-#if CURRENT_SONG == SONG_LEGEND
-  #include "songs/theLegend.h"
-  const NoteEvent* song = theLegend;
-#endif
-
-// TODO - add this to the song file instead of in the main script
-TempoEvent tempoMap[] = {
-  {0.0f, 110},
-  {164.0f, 165},
-  {0, 0}
-};
-
 // Pin-outs
 #define I2S_BCLK 5
 #define I2S_LRC 6
@@ -47,7 +31,6 @@ float         compressorAttack  = 0.001f;
 float         compressorRelease = 0.1f;
 double        samplesPerTick;
 int           songIndex         = 0;
-InternalEvent events[2048];
 int           eventCount        = 0;
 int           eventIndex        = 0;
 
@@ -55,7 +38,6 @@ int16_t sine_table[WAVETABLE_SIZE];
 int16_t square_table[WAVETABLE_SIZE];
 int16_t sawtooth_table[WAVETABLE_SIZE];
 int16_t triangle_table[WAVETABLE_SIZE];
-
 
 // Note lengths
 #define WHOLE 4.0f
@@ -90,6 +72,21 @@ enum EventType {
   TempoChange,
 };
 
+// LPF
+struct LowPassFilter {
+  float cutoff;
+  float resonance;
+  float a0, a1, a2, b0, b1, b2;
+  float x1, x2, y1, y2;
+};
+
+LowPassFilter globalFilter = {
+  6000.0f,
+  1.0f,
+  0, 0, 0, 0, 0, 0,
+  0, 0
+};
+
 // Events (duh)
 struct NoteEvent {
   const char* note;
@@ -97,6 +94,15 @@ struct NoteEvent {
   float duration;
   char key;
 };
+
+// Load song - goal is to make it easy to load different ones on boot
+#define SONG_LEGEND 1
+#define CURRENT_SONG SONG_LEGEND
+
+#if CURRENT_SONG == SONG_LEGEND
+  #include "songs/theLegend.h"
+  const NoteEvent* song = theLegend;
+#endif
 
 struct InternalEvent {
   uint64_t sampleTime;
@@ -107,9 +113,18 @@ struct InternalEvent {
   float newBPM;
 };
 
+InternalEvent events[2048];
+
 struct TempoEvent {
   float beat; 
   float bpm;
+};
+
+// TODO - add this to the song file instead of in the main script
+TempoEvent tempoMap[] = {
+  {0.0f, 110},
+  {164.0f, 165},
+  {0, 0}
 };
 
 struct Voice {
@@ -172,6 +187,50 @@ float updateADSR(Voice *voice, ADSR *adsr, float sampleTime) {
 
   return voice->envLevel;
 }
+
+// low pass filter stuff
+void updateFilterCoefficients(LowPassFilter* filter) {
+  float freq = filter->cutoff;
+  if (freq > SAMPLE_RATE * 0.45f) freq = SAMPLE_RATE * 0.45f;
+  if (freq < 20.0f) freq = 20.0f;
+  
+  float res = filter->resonance;
+  if (res < 0.5f) res = 0.5f;
+  if (res > 10.0f) res = 10.0f;
+  
+  float omega = 2.0f * PI * freq / SAMPLE_RATE;
+  float sin_omega = sin(omega);
+  float cos_omega = cos(omega);
+  float alpha = sin_omega / (2.0f * res);
+  
+  float norm = 1.0f / (1.0f + alpha);
+
+  filter->b0 = ((1.0f - cos_omega) * 0.5f) * norm;
+  filter->b1 = (1.0f - cos_omega) * norm;
+  filter->b2 = filter->b0;
+  filter->a0 = 1.0f;
+  filter->a1 = (-2.0f * cos_omega) * norm;
+  filter->a2 = (1.0f - alpha) * norm;
+}
+
+float processFilter(LowPassFilter* filter, float input) {
+  float output = filter->b0 * input + filter->b1 * filter->x1 + filter->b2 * filter->x2
+                - filter->a1 * filter->y1 - filter->a2 * filter->y2;
+
+  if (isnan(output) || isinf(output)) {
+    filter->x1 = filter->x2 = 0;
+    filter->y1 = filter->y2 = 0;
+    output = input * 0.5f; 
+  }
+
+  filter->x2 = filter->x1;
+  filter->x1 = input;
+  filter->y2 = filter->y1;
+  filter->y1 = output;
+  
+  return output;
+}
+
 
 int searchFreeVoice() {
   for (int i = 0; i < MAX_VOICES; i++) {
@@ -377,6 +436,7 @@ int16_t getNextSample(int16_t *wavetable) {
   }
 
   mix *= MASTER_GAIN;
+  mix = processFilter(&globalFilter, mix);
 
   float targetGain = 1.0f;
   float absMix = fabs(mix);
@@ -404,6 +464,7 @@ uint64_t playheadSamples = 0;
 void setup(){
   
   setCpuFrequencyMhz(240);
+  updateFilterCoefficients(&globalFilter);
 
   voicePhaseCounter = 0x12345678;
   
