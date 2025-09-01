@@ -3,46 +3,7 @@
 #include <math.h>
 #include "esp_system.h"
 
-#define I2S_BCLK 5
-#define I2S_LRC 6
-#define I2S_DIN 4
-#define I2S_NUM I2S_NUM_0
-#define GAIN_PIN 7
-#define SAMPLE_RATE 44100
-#define MASTER_GAIN 1.0f
-
-#define PIN_SINE 9
-#define PIN_SQUARE 10
-#define PIN_SAW 11
-#define PIN_TRIANGLE 12
-int16_t* selectedWaveTable;
-
-#define WAVETABLE_SIZE 2048
-#define PHASE_ACCUMULATOR_MAX 0xFFFFFFFF
-#define MAX_VOICES 8
-
-float compressorGain = 1.0f;
-float compressorAttack = 0.001f;
-float compressorRelease = 0.1f;
-
-#define WHOLE 4.0f
-#define HALF 2.0f
-#define QUARTER 1.0f
-#define EIGHTH 0.5f
-#define SIXTEENTH 0.25f
-
-// Song-specific configs
-#define PPQ 480
-double samplesPerTick;
-int songIndex = 0;
-
-struct NoteEvent {
-  const char* note;
-  float startBeat;
-  float duration;
-  char key;
-};
-
+// Load song - goal is to make it easy to load different ones on boot
 #define SONG_LEGEND 1
 #define CURRENT_SONG SONG_LEGEND
 
@@ -51,6 +12,61 @@ struct NoteEvent {
   const NoteEvent* song = theLegend;
 #endif
 
+// TODO - add this to the song file instead of in the main script
+TempoEvent tempoMap[] = {
+  {0.0f, 110},
+  {164.0f, 165},
+  {0, 0}
+};
+
+// Pin-outs
+#define I2S_BCLK 5
+#define I2S_LRC 6
+#define I2S_DIN 4
+#define GAIN_PIN 7
+
+#define I2S_NUM I2S_NUM_0
+
+// Pin-outs (bridge to ground to get specified wave)
+#define PIN_SINE 9
+#define PIN_SQUARE 10
+#define PIN_SAW 11
+#define PIN_TRIANGLE 12
+
+// Synth conf
+#define SAMPLE_RATE 44100
+#define MASTER_GAIN 1.0f
+#define WAVETABLE_SIZE 2048
+#define PHASE_ACCUMULATOR_MAX 0xFFFFFFFF
+#define MAX_VOICES 8
+
+// Global variables
+int16_t*      selectedWaveTable;
+float         compressorGain    = 1.0f;
+float         compressorAttack  = 0.001f;
+float         compressorRelease = 0.1f;
+double        samplesPerTick;
+int           songIndex         = 0;
+InternalEvent events[2048];
+int           eventCount        = 0;
+int           eventIndex        = 0;
+
+int16_t sine_table[WAVETABLE_SIZE];
+int16_t square_table[WAVETABLE_SIZE];
+int16_t sawtooth_table[WAVETABLE_SIZE];
+int16_t triangle_table[WAVETABLE_SIZE];
+
+
+// Note lengths
+#define WHOLE 4.0f
+#define HALF 2.0f
+#define QUARTER 1.0f
+#define EIGHTH 0.5f
+#define SIXTEENTH 0.25f
+
+#define PPQ 480
+
+// ADSR
 enum ADSRState {
   Inactive,
   Attack,
@@ -74,6 +90,14 @@ enum EventType {
   TempoChange,
 };
 
+// Events (duh)
+struct NoteEvent {
+  const char* note;
+  float startBeat;
+  float duration;
+  char key;
+};
+
 struct InternalEvent {
   uint64_t sampleTime;
   float frequency;
@@ -87,21 +111,6 @@ struct TempoEvent {
   float beat; 
   float bpm;
 };
-
-TempoEvent tempoMap[] = {
-  {0.0f, 110},
-  {164.0f, 165},
-  {0, 0}
-};
-
-InternalEvent events[2048];
-int eventCount = 0;
-int eventIndex = 0;
-
-int16_t sine_table[WAVETABLE_SIZE];
-int16_t square_table[WAVETABLE_SIZE];
-int16_t sawtooth_table[WAVETABLE_SIZE];
-int16_t triangle_table[WAVETABLE_SIZE];
 
 struct Voice {
   uint32_t phase_accumulator;
@@ -227,6 +236,7 @@ void generateTables() {
 
 }
 
+// best function name i've ever made
 float noteToFrequency(const char* noteName) {
   
   static const char* names[] = {
