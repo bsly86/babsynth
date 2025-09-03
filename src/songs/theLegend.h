@@ -1,3 +1,11 @@
+const WaveType wave[] = { SQUARE };
+
+const TempoEvent legendTempo[] = {
+  {0.0f, 110},
+  {164.0f, 165},
+  {0, 0}
+};
+
 const NoteEvent theLegend[] PROGMEM = {
     {"A4", 0.0f, 3.798f, 'A'},
     {"C5", 1.0f, EIGHTH, 'B'},

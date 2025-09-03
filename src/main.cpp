@@ -2,6 +2,7 @@
 #include "driver/i2s.h"
 #include <math.h>
 #include "esp_system.h"
+#include <Adafruit_NeoPixel.h>
 
 // Pin-outs
 #define I2S_BCLK 5
@@ -9,13 +10,16 @@
 #define I2S_DIN 4
 #define GAIN_PIN 7
 
+#define LED 48
+#define NUM_PIXELS 1
+Adafruit_NeoPixel pixel(NUM_PIXELS, LED, NEO_GRB + NEO_KHZ800);
+
 #define I2S_NUM I2S_NUM_0
 
-// Pin-outs (bridge to ground to get specified wave)
-#define PIN_SINE 9
-#define PIN_SQUARE 10
-#define PIN_SAW 11
-#define PIN_TRIANGLE 12
+// Pin-outs (bridge to ground)
+#define PIN_PLAY  9
+#define PIN_PAUSE 10
+#define PIN_STOP  11
 
 // Synth conf
 #define SAMPLE_RATE 44100
@@ -38,6 +42,8 @@ int16_t sine_table[WAVETABLE_SIZE];
 int16_t square_table[WAVETABLE_SIZE];
 int16_t sawtooth_table[WAVETABLE_SIZE];
 int16_t triangle_table[WAVETABLE_SIZE];
+
+int16_t* WaveTables[] = { sine_table, square_table, sawtooth_table, triangle_table };
 
 // Note lengths
 #define WHOLE 4.0f
@@ -72,6 +78,13 @@ enum EventType {
   TempoChange,
 };
 
+enum WaveType {
+  SINE,
+  SQUARE,
+  SAW,
+  TRI
+};
+
 // LPF
 struct LowPassFilter {
   float cutoff;
@@ -95,6 +108,11 @@ struct NoteEvent {
   char key;
 };
 
+struct TempoEvent {
+  float beat; 
+  float bpm;
+};
+
 // Load song - goal is to make it easy to load different ones on boot
 #define SONG_LEGEND 1
 #define CURRENT_SONG SONG_LEGEND
@@ -102,6 +120,8 @@ struct NoteEvent {
 #if CURRENT_SONG == SONG_LEGEND
   #include "songs/theLegend.h"
   const NoteEvent* song = theLegend;
+  const TempoEvent* tempoMap = legendTempo;
+  const WaveType* enumSelectedWave = &wave[0]; 
 #endif
 
 struct InternalEvent {
@@ -115,18 +135,6 @@ struct InternalEvent {
 
 InternalEvent events[2048];
 
-struct TempoEvent {
-  float beat; 
-  float bpm;
-};
-
-// TODO - add this to the song file instead of in the main script
-TempoEvent tempoMap[] = {
-  {0.0f, 110},
-  {164.0f, 165},
-  {0, 0}
-};
-
 struct Voice {
   uint32_t phase_accumulator;
   uint32_t phase_increment;
@@ -139,9 +147,39 @@ struct Voice {
   float envTime;
 };
 
+
+
 Voice voices[MAX_VOICES];
 
 uint32_t voicePhaseCounter = 0;
+
+enum TransportState {
+  Stopped,
+  Playing,
+  Paused
+};
+
+volatile TransportState transport = Stopped;
+
+void IRAM_ATTR playISR() { transport = Playing; }
+void IRAM_ATTR pauseISR() { transport = Paused; }
+void IRAM_ATTR stopISR() { transport = Stopped; } 
+
+// Add near your other globals
+TransportState lastTransportShown = Stopped;
+
+void updateNeoPixel() {
+  if (transport == lastTransportShown) return; // only update on change
+
+  switch (transport) {
+    case Playing: pixel.setPixelColor(0, pixel.Color(0, 255, 0)); break;     // green
+    case Paused:  pixel.setPixelColor(0, pixel.Color(255, 255, 0)); break;   // yellow
+    case Stopped: pixel.setPixelColor(0, pixel.Color(255, 0, 0)); break;     // red
+  }
+  pixel.show();
+  lastTransportShown = transport;
+}
+
 
 float updateADSR(Voice *voice, ADSR *adsr, float sampleTime) {
   voice -> envTime += sampleTime;
@@ -295,7 +333,6 @@ void generateTables() {
 
 }
 
-// best function name i've ever made
 float noteToFrequency(const char* noteName) {
   
   static const char* names[] = {
@@ -466,30 +503,26 @@ void setup(){
   setCpuFrequencyMhz(240);
   updateFilterCoefficients(&globalFilter);
 
+  pinMode(PIN_PLAY, INPUT_PULLUP);
+  pinMode(PIN_PAUSE, INPUT_PULLUP);
+  pinMode(PIN_STOP, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(PIN_PLAY), playISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_PAUSE), pauseISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_STOP),  stopISR,  FALLING);
+
+  pixel.begin();
+  pixel.show();
+
+  selectedWaveTable = (*enumSelectedWave < 4) ? WaveTables[*enumSelectedWave] : square_table;
+
   voicePhaseCounter = 0x12345678;
   
   clearVoices();
   generateTables();
   buildEvents();
   
-  pinMode(PIN_SINE, INPUT_PULLUP);
-  pinMode(PIN_SQUARE, INPUT_PULLUP);
-  pinMode(PIN_SAW, INPUT_PULLUP);
-  pinMode(PIN_TRIANGLE, INPUT_PULLUP);
-
   delay(10);
-
-  if (digitalRead(PIN_SINE) == LOW) {
-    selectedWaveTable = sine_table;
-  } else if (digitalRead(PIN_SQUARE) == LOW) {
-    selectedWaveTable = square_table;
-  } else if (digitalRead(PIN_SAW) == LOW) {
-    selectedWaveTable = sawtooth_table;
-  } else if (digitalRead(PIN_TRIANGLE) == LOW) {
-    selectedWaveTable = triangle_table;
-  } else {
-    selectedWaveTable = square_table;
-  }
 
   pinMode(GAIN_PIN, OUTPUT);
 
@@ -530,8 +563,23 @@ void loop(){
   const int BUF = 1024;
   uint32_t stereo[BUF];
 
-  for(int i = 0; i < BUF; i++){
-    int16_t s = getNextSample(selectedWaveTable);
+  for (int i = 0; i < BUF; i++) {
+    int16_t s = 0;
+
+    if (transport == Playing) {
+      s = getNextSample(selectedWaveTable);
+    }
+    else if (transport == Paused) {
+      s = 0;
+    }
+    else if (transport == Stopped) {
+      // clear everything
+      clearVoices();
+      eventIndex = 0;
+      playheadSamples = 0;
+      s = 0;
+    }
+
     stereo[i] = ((uint32_t)(uint16_t)s << 16) | (uint16_t)s;
   }
 
@@ -541,4 +589,6 @@ void loop(){
   uint64_t prev = playheadSamples;
   playheadSamples += BUF;
   processEvents(prev, playheadSamples);
+
+  updateNeoPixel();
 }
