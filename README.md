@@ -3,6 +3,7 @@ an embedded, lightweight playback synthesizer. powered by ESP32 w/ portable "cas
 
 # progress markers
 - synthesis and playback - ✅
+  - generates wavetables @ boot. plan on having them pre-generated instead of doing so on each boot 
 - playback control - ✅
   - uses GPIO pins and sees whether they are pulled LOW or not (i don't want to buy buttons right now). play / pause / stop
 - cassette system - ❌
